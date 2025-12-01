@@ -1,0 +1,7 @@
+displayName: Free Tier Rate Limiter
+type: middleware
+import: github.com/findonflow/traefik-free-tier-plugin
+summary: Rate limits requests using free:free Basic Auth by IP
+testData:
+  rate: 10
+  burst: 20
