@@ -1,3 +1,3 @@
-module github.com/findonflow/traefik-free-tier-plugin
+module github.com/willsu88/traefik-plugin
 
 go 1.21
