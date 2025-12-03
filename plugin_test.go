@@ -2,125 +2,145 @@ package traefik_plugin
 
 import (
 	"context"
-	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
-func TestFreeTierLimiter_NonFreeUser(t *testing.T) {
-	cfg := CreateConfig()
-	cfg.Rate = 1
-	cfg.Burst = 1
-
+func newHandler(cfg *Config) http.Handler {
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 	})
-
-	handler, err := New(context.Background(), next, cfg, "test")
+	h, err := New(context.Background(), next, cfg, "test")
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
-
-	// Request without auth should pass through
-	for i := 0; i < 10; i++ {
-		req := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
-		rr := httptest.NewRecorder()
-		handler.ServeHTTP(rr, req)
-
-		if rr.Code != http.StatusOK {
-			t.Errorf("Expected 200, got %d", rr.Code)
-		}
-	}
+	return h
 }
 
-func TestFreeTierLimiter_FreeUser_RateLimited(t *testing.T) {
+func TestDefaultTierWhenHeaderMissing(t *testing.T) {
 	cfg := CreateConfig()
-	cfg.Rate = 1
-	cfg.Burst = 2
-
-	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		rw.WriteHeader(http.StatusOK)
-	})
-
-	handler, err := New(context.Background(), next, cfg, "test")
-	if err != nil {
-		t.Fatal(err)
+	cfg.Tiers = map[string]TierConfig{
+		"free": {Rate: 1, Burst: 1},
 	}
+	h := newHandler(cfg)
 
-	freeAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("free:free"))
-
-	// First 2 requests should succeed (burst)
-	for i := 0; i < 2; i++ {
-		req := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
-		req.Header.Set("Authorization", freeAuth)
-		req.Header.Set("X-Forwarded-For", "1.2.3.4")
-		rr := httptest.NewRecorder()
-		handler.ServeHTTP(rr, req)
-
-		if rr.Code != http.StatusOK {
-			t.Errorf("Request %d: Expected 200, got %d", i, rr.Code)
-		}
-	}
-
-	// Third request should be rate limited
 	req := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
-	req.Header.Set("Authorization", freeAuth)
 	req.Header.Set("X-Forwarded-For", "1.2.3.4")
 	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
+	h.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusTooManyRequests {
-		t.Errorf("Expected 429, got %d", rr.Code)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+
+	// Second request should be rate-limited (burst 1, rate 1/s)
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, req)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", rr2.Code)
 	}
 }
 
-func TestFreeTierLimiter_DifferentIPs_IndependentLimits(t *testing.T) {
+func TestTierSpecificLimits(t *testing.T) {
 	cfg := CreateConfig()
-	cfg.Rate = 1
-	cfg.Burst = 1
-
-	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		rw.WriteHeader(http.StatusOK)
-	})
-
-	handler, err := New(context.Background(), next, cfg, "test")
-	if err != nil {
-		t.Fatal(err)
+	cfg.HeaderName = "X-User-Category"
+	cfg.DefaultTier = "free"
+	cfg.Tiers = map[string]TierConfig{
+		"free": {Rate: 1, Burst: 1},
+		"pro":  {Rate: 10, Burst: 10},
 	}
+	h := newHandler(cfg)
 
-	freeAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("free:free"))
+	// Free tier should rate-limit after first request
+	reqFree := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
+	reqFree.Header.Set("X-User-Category", "free")
+	reqFree.Header.Set("X-Forwarded-For", "1.1.1.1")
 
-	// First IP uses its burst
-	req1 := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
-	req1.Header.Set("Authorization", freeAuth)
-	req1.Header.Set("X-Forwarded-For", "1.1.1.1")
 	rr1 := httptest.NewRecorder()
-	handler.ServeHTTP(rr1, req1)
-
+	h.ServeHTTP(rr1, reqFree)
 	if rr1.Code != http.StatusOK {
-		t.Errorf("First IP first request: Expected 200, got %d", rr1.Code)
+		t.Fatalf("free first: expected 200, got %d", rr1.Code)
 	}
-
-	// Second IP should still have its own burst available
-	req2 := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
-	req2.Header.Set("Authorization", freeAuth)
-	req2.Header.Set("X-Forwarded-For", "2.2.2.2")
 	rr2 := httptest.NewRecorder()
-	handler.ServeHTTP(rr2, req2)
-
-	if rr2.Code != http.StatusOK {
-		t.Errorf("Second IP first request: Expected 200, got %d", rr2.Code)
+	h.ServeHTTP(rr2, reqFree)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("free second: expected 429, got %d", rr2.Code)
 	}
 
-	// First IP should now be rate limited
-	req3 := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
-	req3.Header.Set("Authorization", freeAuth)
-	req3.Header.Set("X-Forwarded-For", "1.1.1.1")
-	rr3 := httptest.NewRecorder()
-	handler.ServeHTTP(rr3, req3)
+	// Pro tier should allow multiple within burst
+	reqPro := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
+	reqPro.Header.Set("X-User-Category", "pro")
+	reqPro.Header.Set("X-Forwarded-For", "2.2.2.2")
 
-	if rr3.Code != http.StatusTooManyRequests {
-		t.Errorf("First IP second request: Expected 429, got %d", rr3.Code)
+	for i := 0; i < 5; i++ {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, reqPro)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("pro request %d: expected 200, got %d", i+1, rr.Code)
+		}
+	}
+}
+
+func TestBucketsAreTierIsolated(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.Tiers = map[string]TierConfig{
+		"free": {Rate: 1, Burst: 1},
+		"pro":  {Rate: 1, Burst: 1},
+	}
+	h := newHandler(cfg)
+
+	reqFree := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
+	reqFree.Header.Set("X-User-Category", "free")
+	reqFree.Header.Set("X-Forwarded-For", "3.3.3.3")
+
+	reqPro := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
+	reqPro.Header.Set("X-User-Category", "pro")
+	reqPro.Header.Set("X-Forwarded-For", "3.3.3.3") // same IP, different tier
+
+	// Consume free burst
+	rr1 := httptest.NewRecorder()
+	h.ServeHTTP(rr1, reqFree)
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, reqFree)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("free second should be 429, got %d", rr2.Code)
+	}
+
+	// Pro should still have its own bucket
+	rrPro := httptest.NewRecorder()
+	h.ServeHTTP(rrPro, reqPro)
+	if rrPro.Code != http.StatusOK {
+		t.Fatalf("pro should be 200, got %d", rrPro.Code)
+	}
+}
+
+func TestTokensRefillOverTime(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.Tiers = map[string]TierConfig{
+		"free": {Rate: 1, Burst: 1},
+	}
+	h := newHandler(cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
+	req.Header.Set("X-User-Category", "free")
+	req.Header.Set("X-Forwarded-For", "4.4.4.4")
+
+	rr1 := httptest.NewRecorder()
+	h.ServeHTTP(rr1, req)
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, req)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request should be 429, got %d", rr2.Code)
+	}
+
+	// Wait for 1s to refill
+	time.Sleep(time.Second)
+
+	rr3 := httptest.NewRecorder()
+	h.ServeHTTP(rr3, req)
+	if rr3.Code != http.StatusOK {
+		t.Fatalf("after refill expected 200, got %d", rr3.Code)
 	}
 }

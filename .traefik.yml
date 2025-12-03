@@ -1,7 +1,11 @@
-displayName: Free Tier Rate Limiter
+displayName: Tiered Rate Limit
 type: middleware
 import: github.com/willsu88/traefik-plugin
-summary: Rate limits requests using free:free Basic Auth by IP
+summary: Tier-aware rate limiting based on forwardAuth header
 testData:
-  rate: 10
-  burst: 20
+  headerName: X-User-Category
+  defaultTier: free
+  tiers:
+    free: { rate: 2, burst: 5 }
+    pro: { rate: 20, burst: 40 }
+    enterprise: { rate: 100, burst: 200 }

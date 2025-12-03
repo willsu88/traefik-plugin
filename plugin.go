@@ -2,137 +2,119 @@ package traefik_plugin
 
 import (
 	"context"
-	"encoding/base64"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Config holds the plugin configuration
-type Config struct {
-	Rate  int `json:"rate,omitempty"`  // requests per second
+type TierConfig struct {
+	Rate  int `json:"rate,omitempty"`  // req/s
 	Burst int `json:"burst,omitempty"` // max burst
 }
 
-// CreateConfig creates the default plugin configuration
+type Config struct {
+	HeaderName  string                `json:"headerName,omitempty"`  // e.g. X-User-Category
+	DefaultTier string                `json:"defaultTier,omitempty"` // fallback if header missing
+	Tiers       map[string]TierConfig `json:"tiers,omitempty"`       // tier -> limits
+}
+
 func CreateConfig() *Config {
 	return &Config{
-		Rate:  10,
-		Burst: 20,
+		HeaderName:  "X-User-Category",
+		DefaultTier: "free",
+		Tiers: map[string]TierConfig{
+			"free":       {Rate: 2, Burst: 5},
+			"pro":        {Rate: 20, Burst: 40},
+			"enterprise": {Rate: 100, Burst: 200},
+		},
 	}
 }
 
-// FreeTierLimiter is the plugin struct
-type FreeTierLimiter struct {
-	next    http.Handler
-	name    string
-	rate    int
-	burst   int
-	clients map[string]*clientLimiter
-	mu      sync.RWMutex
+type Middleware struct {
+	next        http.Handler
+	headerName  string
+	defaultTier string
+	tiers       map[string]TierConfig
+	mu          sync.Mutex
+	buckets     map[string]*bucket // key: tier + ":" + clientID
 }
 
-type clientLimiter struct {
+type bucket struct {
 	tokens    float64
 	lastCheck time.Time
 }
 
-// New creates a new plugin instance
-func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	return &FreeTierLimiter{
-		next:    next,
-		name:    name,
-		rate:    config.Rate,
-		burst:   config.Burst,
-		clients: make(map[string]*clientLimiter),
+func New(_ context.Context, next http.Handler, cfg *Config, _ string) (http.Handler, error) {
+	return &Middleware{
+		next:        next,
+		headerName:  cfg.HeaderName,
+		defaultTier: cfg.DefaultTier,
+		tiers:       cfg.Tiers,
+		buckets:     make(map[string]*bucket),
 	}, nil
 }
 
-func (f *FreeTierLimiter) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// Check if this is a free:free auth request
-	if !f.isFreeUser(req) {
-		// Not a free user, pass through without rate limiting
-		f.next.ServeHTTP(rw, req)
+func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	tier := strings.TrimSpace(req.Header.Get(m.headerName))
+	if tier == "" {
+		tier = m.defaultTier
+	}
+	lim, ok := m.tiers[tier]
+	if !ok || (lim.Rate == 0 && lim.Burst == 0) {
+		m.next.ServeHTTP(rw, req)
 		return
 	}
 
-	// Get client IP
-	clientIP := f.getClientIP(req)
+	clientID := clientIP(req) // or IP+header if you want finer keys
+	key := tier + ":" + clientID
 
-	// Check rate limit
-	if !f.allow(clientIP) {
+	if !m.allow(key, lim) {
 		rw.Header().Set("Retry-After", "1")
-		http.Error(rw, "Rate limit exceeded for free tier", http.StatusTooManyRequests)
+		http.Error(rw, "Rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
-
-	f.next.ServeHTTP(rw, req)
+	m.next.ServeHTTP(rw, req)
 }
 
-func (f *FreeTierLimiter) isFreeUser(req *http.Request) bool {
-	auth := req.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Basic ") {
-		return false
+func (m *Middleware) allow(key string, lim TierConfig) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	b, ok := m.buckets[key]
+	if !ok {
+		m.buckets[key] = &bucket{tokens: float64(lim.Burst - 1), lastCheck: now}
+		return true
 	}
 
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(auth, "Basic "))
-	if err != nil {
+	elapsed := now.Sub(b.lastCheck).Seconds()
+	b.tokens += elapsed * float64(lim.Rate)
+	if b.tokens > float64(lim.Burst) {
+		b.tokens = float64(lim.Burst)
+	}
+	b.lastCheck = now
+
+	if b.tokens < 1 {
 		return false
 	}
-
-	return string(decoded) == "free:free"
+	b.tokens--
+	return true
 }
 
-func (f *FreeTierLimiter) getClientIP(req *http.Request) string {
-	// Try X-Forwarded-For first
+func clientIP(req *http.Request) string {
 	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP in the chain
 		if idx := strings.Index(xff, ","); idx != -1 {
 			return strings.TrimSpace(xff[:idx])
 		}
 		return strings.TrimSpace(xff)
 	}
-
-	// Try X-Real-IP
 	if xri := req.Header.Get("X-Real-Ip"); xri != "" {
 		return xri
 	}
-
-	// Fall back to remote addr
-	if idx := strings.LastIndex(req.RemoteAddr, ":"); idx != -1 {
-		return req.RemoteAddr[:idx]
+	host := req.RemoteAddr
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		return host[:idx]
 	}
-	return req.RemoteAddr
-}
-
-func (f *FreeTierLimiter) allow(clientIP string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	now := time.Now()
-
-	client, exists := f.clients[clientIP]
-	if !exists {
-		f.clients[clientIP] = &clientLimiter{
-			tokens:    float64(f.burst - 1),
-			lastCheck: now,
-		}
-		return true
-	}
-
-	// Token bucket algorithm
-	elapsed := now.Sub(client.lastCheck).Seconds()
-	client.tokens += elapsed * float64(f.rate)
-	if client.tokens > float64(f.burst) {
-		client.tokens = float64(f.burst)
-	}
-	client.lastCheck = now
-
-	if client.tokens < 1 {
-		return false
-	}
-
-	client.tokens--
-	return true
+	return host
 }
